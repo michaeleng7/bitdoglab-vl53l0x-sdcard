@@ -36,53 +36,90 @@ FATFS fs;
 
 // === Function to record distance on SD card ===
 void record_distance(uint16_t distance_cm, const char* status, uint64_t time_ms) {
+    static bool first_write = true;
     FIL file;
-    char line[80], value_str[16], unit[4];
+    FRESULT fr;
 
-    // Decide the unit and value to be recorded
-    if (distance_cm >= 100 && distance_cm < INVALID_DISTANCE) {
-        snprintf(value_str, sizeof(value_str), "%.2f", distance_cm / 100.0f);
-        strcpy(unit, "m");
-    } else if (distance_cm == INVALID_DISTANCE) {
-        strcpy(value_str, "ERROR");
-        strcpy(unit, "");
-    } else {
-        snprintf(value_str, sizeof(value_str), "%d", distance_cm);
-        strcpy(unit, "cm");
+    // If it is the first time it is written, it creates a header.
+    if (first_write) {
+        fr = f_open(&file, "distance.txt", FA_WRITE | FA_CREATE_ALWAYS);
+        if (fr == FR_OK) {
+            f_printf(&file, "Time,Distance,Unit,Status\n");
+            f_close(&file);
+            first_write = false;
+        }
     }
 
-    // Calculates time in minutes and seconds since boot
-    unsigned long minutes = time_ms / 60000;
-    unsigned long seconds = (time_ms / 1000) % 60;
-
-    // Open file and record line
-    FRESULT fr = f_open(&file, "distance.txt", FA_OPEN_APPEND | FA_WRITE);
+    fr = f_open(&file, "distance.txt", FA_OPEN_APPEND | FA_WRITE);
     if (fr == FR_OK) {
-        snprintf(line, sizeof(line), "[%02lu:%02lu] Distance: %s %s - Status: %s\n",
-                 minutes, seconds, value_str, unit, status);
-        UINT bytes_written;
-        f_write(&file, line, strlen(line), &bytes_written);
+        char line[80];
+        unsigned long minutes = time_ms / 60000;
+        unsigned long seconds = (time_ms / 1000) % 60;
+
+        if (distance_cm >= 100 && distance_cm < INVALID_DISTANCE) {
+            f_printf(&file, "%02lu:%02lu,%.2f,m,%s\n", 
+                    minutes, seconds, distance_cm / 100.0f, status);
+        } else if (distance_cm == INVALID_DISTANCE) {
+            f_printf(&file, "%02lu:%02lu,ERROR,-,%s\n", 
+                    minutes, seconds, status);
+        } else {
+            f_printf(&file, "%02lu:%02lu,%d,cm,%s\n", 
+                    minutes, seconds, distance_cm, status);
+        }
+        
         f_close(&file);
     } else {
-        printf("Error opening file: %d\n", fr);
+        printf("File open failed: %d\n", fr);
     }
 }
 
 // === SD Card Initialization ===
 void initialize_sd() {
-    spi_init(SPI_PORT, 1000 * 1000);
+    // Reduces SPI speed for increased reliability
+    spi_init(SPI_PORT, 400 * 1000); // Reduces to 400kHz
+
+    // Configura os pinos SPI
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    
+    // Configura o CS com pull-up
     gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
+    gpio_pull_up(PIN_CS);
 
+    // Short delay for stabilization
+    sleep_ms(100);
+
+    printf("Initializing SD card...\n");
     FRESULT fr = f_mount(&fs, "", 1);
+    
+    if (fr == FR_NO_FILESYSTEM) {
+        printf("No filesystem found. Formatting card...\n");
+        MKFS_PARM opt = {FM_FAT32, 0, 0, 0, 0};
+        BYTE work[FF_MAX_SS];
+        fr = f_mkfs("", &opt, work, sizeof(work));
+        if (fr == FR_OK) {
+            printf("Format successful. Mounting...\n");
+            fr = f_mount(NULL, "", 0);      // Unmount first
+            fr = f_mount(&fs, "", 1);       // Mount again
+        }
+    }
+
     if (fr != FR_OK) {
-        printf("Error when mounting SD: %d\n", fr);
+        printf("SD card mount failed (%d)\n", fr);
+        return;
+    }
+
+    // Try to create/open test file
+    FIL fil;
+    fr = f_open(&fil, "test.txt", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr == FR_OK) {
+        f_close(&fil);
+        printf("SD card and filesystem OK\n");
     } else {
-        printf("SD card mounted successfully.\n");
+        printf("File creation failed (%d)\n", fr);
     }
 }
 
@@ -117,7 +154,7 @@ int main() {
     stdio_init_all();
     while (!stdio_usb_connected()) sleep_ms(100);
 
-    // Inicializa I2C antes do display e sensor
+    // Initialize I2C before display and sensor
     i2c_init(PORT_I2C, 100 * 1000);
     gpio_set_function(PINO_SDA_I2C, GPIO_FUNC_I2C);
     gpio_set_function(PINO_SCL_I2C, GPIO_FUNC_I2C);
@@ -131,6 +168,10 @@ int main() {
     ssd1306_UpdateScreen();
     printf("Display SSD1306 OK\n");
 
+    // Initialize SD
+    initialize_sd();
+    sleep_ms(1000); // Give the SD time to stabilize
+    
     // Initialize LEDs
     gpio_init(LED_GREEN); gpio_set_dir(LED_GREEN, GPIO_OUT);
     gpio_init(LED_RED); gpio_set_dir(LED_RED, GPIO_OUT);
