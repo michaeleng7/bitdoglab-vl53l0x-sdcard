@@ -4,6 +4,7 @@
 #include "hardware/i2c.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
+#include "hardware/pwm.h"
 #include "vl53l0x.h"
 #include "lib_ssd1306\ssd1306.h"
 #include "lib_ssd1306\ssd1306_fonts.h"
@@ -13,6 +14,10 @@
 #define PORT_I2C i2c0 // VL53L0X on I2C0 bus
 #define PINO_SDA_I2C 0
 #define PINO_SCL_I2C 1
+
+#define BUZZER_PIN 21    // BitDogLab internal buzzer pin
+#define BUZZER_DISTANCE_THRESHOLD 10  // Distance threshold in cm to trigger buzzer
+#define BUZZER_FREQ 4000  // Frequency in Hz for the buzzer
 
 #define LED_GREEN 11
 #define LED_RED 13
@@ -25,6 +30,7 @@
 
 #define INVALID_DISTANCE 2001 // Value to indicate invalid reading (>2m)
 #define MAX_DISTANCE_CM 999 // Limit to display in cm, above that it displays in meters
+#define DISTANCE_OFFSET_MM 30  // Calibration offset in millimeters
 
 FATFS fs;
 
@@ -129,17 +135,30 @@ int main() {
     gpio_init(LED_GREEN); gpio_set_dir(LED_GREEN, GPIO_OUT);
     gpio_init(LED_RED); gpio_set_dir(LED_RED, GPIO_OUT);
 
-    // Initialize SD
-    initialize_sd();
-
-    //Initializes VL53L0X sensor
+    // Initializes VL53L0X sensor
     vl53l0x_device sensor;
     printf("Starting VL53L0X...\n");
+    sensor.time_timeout = 5000; // Increase timeout to 5 seconds
     if (!vl53l0x_boot(&sensor, PORT_I2C)) {
         printf("ERROR: Failed to initialize sensor VL53L0X.\n");
         while (1);
     }
     printf("VL53L0X sensor initialized successfully.\n");
+
+    // Initialize Buzzer with PWM
+    gpio_set_function(BUZZER_PIN, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(BUZZER_PIN);
+    uint channel = pwm_gpio_to_channel(BUZZER_PIN);
+    
+    // Set frequency (4kHz)
+    uint32_t clock = 125000000;
+    uint32_t divider16 = clock / BUZZER_FREQ / 4096 + (clock % (BUZZER_FREQ * 4096) != 0);
+    if (divider16 / 16 == 0)
+        divider16 = 16;
+    uint32_t wrap = clock * 16 / divider16 / BUZZER_FREQ - 1;
+    pwm_set_clkdiv_int_frac(slice_num, divider16/16, divider16 & 0xF);
+    pwm_set_wrap(slice_num, wrap);
+    pwm_set_enabled(slice_num, true);
 
     vl53l0x_start_continuous(&sensor, 0);
     printf("Sensor in continuous mode. Collecting data...\n");
@@ -181,15 +200,53 @@ int main() {
         // Error handling and out-of-range logic
         if (distance_cm == INVALID_DISTANCE) {
             printf("Reading error.\n");
+            gpio_put(BUZZER_PIN, 0);
+            // Turns off both LEDs on error
+            gpio_put(LED_GREEN, 0);
+            gpio_put(LED_RED, 0);
         } else if (distance_cm > MAX_DISTANCE_CM) {
             printf("Out of reach.\n");
+            gpio_put(BUZZER_PIN, 0);
+            // Turns off both LEDs when out of range
+            gpio_put(LED_GREEN, 0);
+            gpio_put(LED_RED, 0);
         } else {
-            // Register to SD card only if position changed
+            // Register to SD card
             record_distance(distance_cm, port_status, time_ms);
 
-            gpio_put(LED_GREEN, strcmp(port_status, "OPEN") == 0);
-            gpio_put(LED_RED, strcmp(port_status, "OPEN") != 0);
+            // LED logic
+            if (distance_cm < 10) {  // Very close - Red alert
+                gpio_put(LED_GREEN, 0);
+                gpio_put(LED_RED, 1);
+            } else if (distance_cm < 50) {  // Object detected - green LED
+                gpio_put(LED_GREEN, 1);
+                gpio_put(LED_RED, 0);
+            } else {  // No objects nearby - LEDs off
+                gpio_put(LED_GREEN, 0);
+                gpio_put(LED_RED, 0);
+            }
+
+            // Buzzer control with soft beep pattern
+            static uint32_t last_buzzer_toggle = 0;
+            uint32_t current_time = to_ms_since_boot(get_absolute_time());
+            
+            if (distance_cm < BUZZER_DISTANCE_THRESHOLD) {
+                uint32_t elapsed_time = current_time - last_buzzer_toggle;
+                
+                if (elapsed_time >= 1100) { // Reset cycle after 1.1 seconds
+                    last_buzzer_toggle = current_time;
+                    // Set 50% duty cycle for clear beep
+                    pwm_set_chan_level(slice_num, channel, wrap / 2);
+                } else if (elapsed_time >= 100) { // Turn off after 100ms
+                    // Set 0% duty cycle to turn off
+                    pwm_set_chan_level(slice_num, channel, 0);
+                }
+            } else {
+                pwm_set_chan_level(slice_num, channel, 0);
+                last_buzzer_toggle = current_time;
+            }
         }
+        
         sleep_ms(200);
     }
     return 0;

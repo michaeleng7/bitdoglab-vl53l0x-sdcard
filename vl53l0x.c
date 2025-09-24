@@ -1,4 +1,3 @@
-
 #include "vl53l0x.h"
 #include "pico/stdlib.h"
 #include <string.h>
@@ -7,6 +6,8 @@
 #define STANDARD_TIME_MEASUREMENT 33000
 //Value representing an invalid distance (as the sensor can measure up to 2 meters)
 #define INVALID_DISTANCE 2001
+// Calibration offset in millimeters
+#define DISTANCE_OFFSET_MM 50
 
 // ========================== Auxiliary functions ==========================
 
@@ -140,11 +141,14 @@ uint16_t vl53l0x_reads_distance_from_sensor_cm(vl53l0x_device* dev) {
 
     // Reads distance in millimeters
     uint16_t distance_mm = read_reg16(dev, 0x1E);
-    write_reg(dev, 0x0B, 0x01); // Clear interrupt flag
+    
+    // Aplica offset de calibração
+    if (distance_mm > DISTANCE_OFFSET_MM) {
+        distance_mm -= DISTANCE_OFFSET_MM;
+    } else {
+        distance_mm = 0;
+    }
 
-    // Check if the distance is valid
-    if (distance_mm >= 2001 || distance_mm == INVALID_DISTANCE) return INVALID_DISTANCE;
-
-    // Convert to centimeters
+    // Convert to centimeters and return
     return distance_mm / 10;
 }
